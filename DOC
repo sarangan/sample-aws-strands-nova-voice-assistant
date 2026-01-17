@@ -1,0 +1,226 @@
+# AWS Strands Nova Voice Assistant - Sequence Flow Diagram
+
+## System Architecture Overview
+
+The system consists of:
+- **Frontend**: React app with voice interface
+- **Backend**: Python WebSocket server with AWS Strands agents
+- **AWS Services**: Bedrock (Nova Sonic), EC2, SSM, Backup
+
+## Sequence Flow Diagram
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Frontend as React Frontend<br/>(VoiceAgent.js)
+    participant WS as WebSocket Server<br/>(server.py)
+    participant S2S as S2S Session Manager<br/>(s2s_session_manager.py)
+    participant Bedrock as Amazon Nova Sonic<br/>(Bedrock)
+    participant Supervisor as Supervisor Agent<br/>(supervisor_agent.py)
+    participant Orchestrator as Agent Orchestrator<br/>(orchestrator.py)
+    participant SpecAgent as Specialized Agent<br/>(EC2/SSM/Backup)
+    participant AWS as AWS Services<br/>(EC2/SSM/Backup APIs)
+
+    Note over User, AWS: 1. Session Initialization
+    User->>Frontend: Click "Start Conversation"
+    Frontend->>WS: WebSocket Connection (ws://localhost:8080)
+    WS->>S2S: Initialize S2sSessionManager
+    S2S->>Bedrock: Create bidirectional stream
+    Bedrock-->>S2S: Stream established
+    S2S-->>WS: Stream ready
+    WS-->>Frontend: Connection confirmed
+
+    Note over User, AWS: 2. Session Setup Events
+    Frontend->>WS: sessionStart event
+    WS->>S2S: Forward sessionStart
+    S2S->>Bedrock: Send sessionStart
+    Frontend->>WS: promptStart event (with tool config)
+    WS->>S2S: Forward promptStart
+    S2S->>Bedrock: Send promptStart with supervisorAgent tool
+    Frontend->>WS: contentStartText + textInput (system prompt)
+    WS->>S2S: Forward system prompt
+    S2S->>Bedrock: Send system prompt
+    Frontend->>WS: contentStartAudio
+    WS->>S2S: Forward contentStartAudio
+    S2S->>Bedrock: Send contentStartAudio
+
+    Note over User, AWS: 3. Voice Input Processing
+    User->>Frontend: Speak into microphone
+    Frontend->>Frontend: Capture audio via MediaRecorder
+    Frontend->>Frontend: Resample to 16kHz, convert to base64
+    Frontend->>WS: audioInput event (base64 audio chunks)
+    WS->>S2S: Add to audio queue
+    S2S->>S2S: Process audio queue
+    S2S->>Bedrock: Send audioInput events
+
+    Note over User, AWS: 4. Speech-to-Text & Tool Processing
+    Bedrock->>S2S: textOutput event (transcribed speech)
+    S2S->>WS: Forward textOutput
+    WS->>Frontend: Send textOutput
+    Frontend->>Frontend: Display user message in chat
+    
+    Bedrock->>S2S: toolUse event (supervisorAgent call)
+    S2S->>S2S: Store tool use details
+    Bedrock->>S2S: contentEnd event (TOOL type)
+    S2S->>S2S: Process tool use
+
+    Note over User, AWS: 5. Agent Processing Chain
+    S2S->>Supervisor: Call supervisor_agent.query(user_query)
+    Supervisor->>Supervisor: Analyze query keywords
+    Supervisor->>Orchestrator: Route to appropriate agent
+    Orchestrator->>SpecAgent: Forward query to specialized agent
+    SpecAgent->>AWS: Make AWS API calls
+    AWS-->>SpecAgent: Return AWS data
+    SpecAgent-->>Orchestrator: Return formatted response
+    Orchestrator-->>Supervisor: Return response
+    Supervisor-->>S2S: Return final response
+
+    Note over User, AWS: 6. Tool Result Processing
+    S2S->>S2S: Create tool result events
+    S2S->>Bedrock: Send contentStartTool
+    S2S->>Bedrock: Send toolResult with agent response
+    S2S->>Bedrock: Send contentEnd
+
+    Note over User, AWS: 7. Text-to-Speech Response
+    Bedrock->>S2S: textOutput event (assistant response)
+    S2S->>WS: Forward textOutput
+    WS->>Frontend: Send textOutput
+    Frontend->>Frontend: Display assistant message in chat
+    
+    Bedrock->>S2S: audioOutput events (base64 audio chunks)
+    S2S->>WS: Forward audioOutput
+    WS->>Frontend: Send audioOutput
+    Frontend->>Frontend: Convert base64 to Float32Array
+    Frontend->>Frontend: Play audio via AudioPlayer
+    Frontend->>User: Speak response
+
+    Note over User, AWS: 8. Session Cleanup (when user ends conversation)
+    User->>Frontend: Click "End Conversation"
+    Frontend->>WS: contentEnd + promptEnd + sessionEnd
+    WS->>S2S: Forward end events
+    S2S->>Bedrock: Send end events
+    S2S->>S2S: Close stream
+    Frontend->>Frontend: Stop microphone, cleanup
+```
+
+## Key Data Flow Functions
+
+### Frontend to Backend Communication
+
+**Function: `sendEvent(event)` in VoiceAgent.js**
+```javascript
+sendEvent(event) {
+    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+        this.socket.send(JSON.stringify(event));
+        // Event logging and display
+    }
+}
+```
+
+**Audio Processing Function: `startMicrophone()` in VoiceAgent.js**
+```javascript
+processor.onaudioprocess = async (e) => {
+    // Resample audio to 16kHz
+    // Convert to Int16Array then base64
+    const base64Data = btoa(String.fromCharCode(...new Uint8Array(pcmData.buffer)));
+    // Send via WebSocket
+    this.sendEvent(S2sEvent.audioInput(promptName, audioContentName, base64Data));
+}
+```
+
+### Backend Data Reception
+
+**Function: `websocket_handler()` in server.py**
+```python
+async def websocket_handler(websocket, path, config):
+    async for message in websocket:
+        data = json.loads(message)
+        if 'event' in data:
+            event_type = list(data['event'].keys())[0]
+            if event_type == 'audioInput':
+                # Extract and queue audio data
+                stream_manager.add_audio_chunk(prompt_name, content_name, audio_base64)
+            else:
+                # Forward other events to Bedrock
+                await stream_manager.send_raw_event(data)
+```
+
+**Function: `add_audio_chunk()` in s2s_session_manager.py**
+```python
+def add_audio_chunk(self, prompt_name, content_name, audio_data):
+    self.audio_input_queue.put_nowait({
+        'prompt_name': prompt_name,
+        'content_name': content_name,
+        'audio_bytes': audio_data  # base64 string
+    })
+```
+
+### Agent Processing
+
+**Function: `processToolUse()` in s2s_session_manager.py**
+```python
+async def processToolUse(self, toolName, toolUseContent):
+    if toolName == "supervisoragent":
+        # Extract query from tool content
+        query = content_obj.get("query", content)
+        # Call supervisor agent
+        result = await self.supervisor_agent.query(query)
+        # Limit response length for voice
+        if len(result) > 800:
+            result = result[:800] + "... (truncated for voice)"
+        return {"result": result}
+```
+
+**Function: `route_query()` in supervisor_agent.py**
+```python
+async def route_query(self, query: str) -> str:
+    # Determine which specialized agent to use
+    agent_name = self._determine_agent(query)
+    specialized_agent = self.specialized_agents[agent_name]
+    # Route to specialized agent
+    response = specialized_agent(query)
+    return response
+```
+
+### Backend to Frontend Communication
+
+**Function: `forward_responses()` in server.py**
+```python
+async def forward_responses(websocket, stream_manager):
+    while stream_manager.is_active:
+        # Get response from Bedrock
+        response = await stream_manager.output_queue.get()
+        # Send to WebSocket
+        event = json.dumps(response)
+        await websocket.send(event)
+```
+
+**Function: `handleIncomingMessage()` in VoiceAgent.js**
+```javascript
+handleIncomingMessage(message) {
+    const eventType = Object.keys(message?.event)[0];
+    switch(eventType) {
+        case "textOutput":
+            // Update chat messages
+            chatMessages[contentId].content = content;
+            break;
+        case "audioOutput":
+            // Convert base64 to audio and play
+            const audioData = base64ToFloat32Array(base64Data);
+            this.audioPlayer.playAudio(audioData);
+            break;
+    }
+}
+```
+
+## Data Flow Summary
+
+1. **Voice Input**: User speaks → Frontend captures audio → Resamples to 16kHz → Converts to base64 → Sends via WebSocket
+2. **Backend Processing**: WebSocket server receives → S2S manager queues audio → Sends to Bedrock Nova Sonic
+3. **Speech-to-Text**: Bedrock transcribes speech → Returns textOutput events
+4. **Tool Execution**: Bedrock calls supervisorAgent tool → S2S manager processes → Routes through agent hierarchy
+5. **AWS Operations**: Specialized agents make AWS API calls → Return structured responses
+6. **Text-to-Speech**: Bedrock converts response to speech → Returns audioOutput events
+7. **Voice Output**: Frontend receives base64 audio → Converts to Float32Array → Plays through speakers
+
+The system maintains real-time bidirectional communication using WebSockets and AWS Bedrock's streaming capabilities, with sophisticated audio processing and multi-agent routing for AWS service operations.

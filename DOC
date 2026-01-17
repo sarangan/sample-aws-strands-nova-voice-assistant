@@ -30,19 +30,33 @@ sequenceDiagram
     S2S-->>WS: Stream ready
     WS-->>Frontend: Connection confirmed
 
-    Note over User, AWS: 2. Session Setup Events
+    Note over User, AWS: 2. Session Setup Events (Initialization Sequence)
+    
+    Note right of Frontend: Step 2a: Start Session
     Frontend->>WS: sessionStart event
+    Note right of Frontend: JSON: {"event": {"sessionStart": {"inferenceConfiguration": {...}}}}
     WS->>S2S: Forward sessionStart
-    S2S->>Bedrock: Send sessionStart
-    Frontend->>WS: promptStart event (with tool config)
+    S2S->>Bedrock: Send sessionStart to Nova Sonic
+    
+    Note right of Frontend: Step 2b: Configure Prompt with Tools
+    Frontend->>WS: promptStart event (with supervisorAgent tool)
+    Note right of Frontend: Includes tool definition for AWS agent routing
     WS->>S2S: Forward promptStart
-    S2S->>Bedrock: Send promptStart with supervisorAgent tool
-    Frontend->>WS: contentStartText + textInput (system prompt)
-    WS->>S2S: Forward system prompt
-    S2S->>Bedrock: Send system prompt
-    Frontend->>WS: contentStartAudio
+    S2S->>Bedrock: Send promptStart with supervisorAgent tool config
+    
+    Note right of Frontend: Step 2c: Send System Instructions
+    Frontend->>WS: contentStartText event
+    Frontend->>WS: textInput event (system prompt)
+    Frontend->>WS: contentEnd event
+    Note right of Frontend: System prompt: "You are AWS assistant, use supervisorAgent tool"
+    WS->>S2S: Forward system prompt sequence
+    S2S->>Bedrock: Send system instructions to Nova Sonic
+    
+    Note right of Frontend: Step 2d: Enable Audio Input
+    Frontend->>WS: contentStartAudio event
+    Note right of Frontend: Configures 16kHz audio input for voice
     WS->>S2S: Forward contentStartAudio
-    S2S->>Bedrock: Send contentStartAudio
+    S2S->>Bedrock: Enable audio input stream
 
     Note over User, AWS: 3. Voice Input Processing
     User->>Frontend: Speak into microphone
@@ -59,10 +73,14 @@ sequenceDiagram
     WS->>Frontend: Send textOutput
     Frontend->>Frontend: Display user message in chat
     
+    Note right of Bedrock: Nova Sonic decides to use supervisorAgent tool
     Bedrock->>S2S: toolUse event (supervisorAgent call)
-    S2S->>S2S: Store tool use details
+    Note right of S2S: Store: toolName="supervisorAgent", toolUseId, content=user_query
+    S2S->>S2S: Store tool use details in memory
+    
     Bedrock->>S2S: contentEnd event (TOOL type)
-    S2S->>S2S: Process tool use
+    Note right of S2S: Trigger: Process the stored tool use
+    S2S->>S2S: Call processToolUse() function
 
     Note over User, AWS: 5. Agent Processing Chain
     S2S->>Supervisor: Call supervisor_agent.query(user_query)
@@ -102,6 +120,247 @@ sequenceDiagram
     S2S->>S2S: Close stream
     Frontend->>Frontend: Stop microphone, cleanup
 ```
+
+## Detailed Session Setup Explanation
+
+### What Happens When User Clicks "Start Conversation"
+
+The session setup is a **4-step initialization sequence** that prepares Nova Sonic for voice interaction:
+
+#### Step 2a: sessionStart Event
+**Frontend Code (VoiceAgent.js):**
+```javascript
+// When WebSocket opens
+this.sendEvent(S2sEvent.sessionStart());
+```
+
+**Event Structure:**
+```json
+{
+  "event": {
+    "sessionStart": {
+      "inferenceConfiguration": {
+        "maxTokens": 1024,
+        "topP": 1.0,
+        "temperature": 1.0
+      }
+    }
+  }
+}
+```
+
+**Purpose:** Tells Nova Sonic to start a new conversation session with AI model parameters.
+
+#### Step 2b: promptStart Event (Tool Configuration)
+**Frontend Code (VoiceAgent.js):**
+```javascript
+// Configure tool for AWS agent routing
+const toolConfig = {
+  "tools": [{
+    "toolSpec": {
+      "name": "supervisorAgent",
+      "description": "Routes queries to specialized agents for EC2, Backup, and SSM",
+      "inputSchema": {
+        "json": JSON.stringify({
+          "type": "object",
+          "properties": {
+            "query": {"type": "string", "description": "The user query about AWS services"}
+          },
+          "required": ["query"]
+        })
+      }
+    }
+  }]
+};
+
+this.sendEvent(S2sEvent.promptStart(promptName, audioConfig, toolConfig));
+```
+
+**Purpose:** Configures Nova Sonic to use the `supervisorAgent` tool when it needs to handle AWS queries.
+
+#### Step 2c: System Prompt Setup
+**Frontend Code (VoiceAgent.js):**
+```javascript
+// Send system instructions
+this.sendEvent(S2sEvent.contentStartText(promptName, textContentName));
+this.sendEvent(S2sEvent.textInput(promptName, textContentName, this.state.configSystemPrompt));
+this.sendEvent(S2sEvent.contentEnd(promptName, textContentName));
+```
+
+**System Prompt Content:**
+```
+"You are a specialized AWS assistant that ONLY helps with AWS services and operations.
+When you need to get information about AWS services, use the supervisorAgent tool.
+Keep responses concise and focused on AWS services only."
+```
+
+**Purpose:** Gives Nova Sonic its personality and instructions on when to use the AWS tool.
+
+#### Step 2d: Enable Audio Input
+**Frontend Code (VoiceAgent.js):**
+```javascript
+this.sendEvent(S2sEvent.contentStartAudio(promptName, audioContentName));
+```
+
+**Audio Configuration:**
+```json
+{
+  "mediaType": "audio/lpcm",
+  "sampleRateHertz": 16000,
+  "sampleSizeBits": 16,
+  "channelCount": 1,
+  "audioType": "SPEECH",
+  "encoding": "base64"
+}
+```
+
+**Purpose:** Tells Nova Sonic to expect incoming voice audio in 16kHz format.
+
+### Why This Sequence Matters
+
+1. **sessionStart**: Initializes the AI conversation engine
+2. **promptStart**: Defines what tools (AWS agents) are available
+3. **System Prompt**: Gives the AI its instructions and personality
+4. **Audio Setup**: Enables voice input/output capabilities
+
+After these 4 steps, Nova Sonic is ready to:
+- Listen to voice input
+- Understand it's an AWS assistant
+- Know it can call the supervisorAgent tool for AWS operations
+- Respond with both text and voice
+
+## Detailed Tool Use Process Explanation
+
+### What Happens When Nova Sonic Decides to Use a Tool
+
+The tool use process is a **3-step sequence** where Nova Sonic calls your AWS agents:
+
+#### Step 1: toolUse Event (Nova Sonic's Decision)
+**When:** After Nova Sonic transcribes speech and decides it needs to call the supervisorAgent tool
+
+**Backend Code (s2s_session_manager.py):**
+```python
+# Handle tool use detection
+if event_name == 'toolUse':
+    self.toolUseContent = json_data['event']['toolUse']
+    self.toolName = json_data['event']['toolUse']['toolName']
+    self.toolUseId = json_data['event']['toolUse']['toolUseId']
+    debug_print(f"Tool use detected: {self.toolName}, ID: {self.toolUseId}")
+```
+
+**Example toolUse Event from Bedrock:**
+```json
+{
+  "event": {
+    "toolUse": {
+      "toolName": "supervisorAgent",
+      "toolUseId": "12345-abcde-67890",
+      "content": "{\"query\": \"list my EC2 instances\"}"
+    }
+  }
+}
+```
+
+**What's Stored:**
+- `toolName` = "supervisorAgent"
+- `toolUseId` = unique identifier for this tool call
+- `content` = the user's query that needs to be processed
+
+#### Step 2: Store Tool Use Details
+**Purpose:** The S2S manager temporarily stores the tool information because Bedrock sends tool data in chunks.
+
+**What Gets Stored:**
+```python
+self.toolUseContent = {
+    "toolName": "supervisorAgent",
+    "toolUseId": "12345-abcde-67890", 
+    "content": "{\"query\": \"list my EC2 instances\"}"
+}
+self.toolName = "supervisorAgent"
+self.toolUseId = "12345-abcde-67890"
+```
+
+#### Step 3: contentEnd Event Triggers Processing
+**When:** Bedrock sends a contentEnd event with type="TOOL", signaling the tool call is complete
+
+**Backend Code (s2s_session_manager.py):**
+```python
+# Process tool use when content ends
+elif event_name == 'contentEnd' and json_data['event'][event_name].get('type') == 'TOOL':
+    prompt_name = json_data['event']['contentEnd'].get("promptName")
+    debug_print("Processing tool use and sending result")
+    
+    # THIS IS WHERE THE MAGIC HAPPENS
+    toolResult = await self.processToolUse(self.toolName, self.toolUseContent)
+```
+
+#### Step 4: processToolUse Function (The Core Logic)
+**Backend Code (s2s_session_manager.py):**
+```python
+async def processToolUse(self, toolName, toolUseContent):
+    """Process tool use with Supervisor Agent"""
+    print(f"Tool Use Content: {toolUseContent}")
+    
+    # Extract the user's query
+    content = toolUseContent.get("content")
+    
+    if toolName == "supervisoragent":
+        # Parse the query from JSON
+        if isinstance(content, str):
+            try:
+                content_obj = json.loads(content)
+                query = content_obj.get("query", content)
+            except:
+                query = content
+        
+        # Call the supervisor agent (THIS ROUTES TO AWS AGENTS)
+        result = await self.supervisor_agent.query(query)
+        
+        # Limit response for voice (800 chars max)
+        if len(result) > 800:
+            result = result[:800] + "... (truncated for voice)"
+        
+        return {"result": result}
+```
+
+#### Step 5: Send Tool Result Back to Bedrock
+**Backend Code (s2s_session_manager.py):**
+```python
+# Send tool start event
+toolContent = str(uuid.uuid4())
+tool_start_event = S2sEvent.content_start_tool(prompt_name, toolContent, self.toolUseId)
+await self.send_raw_event(tool_start_event)
+
+# Send tool result event  
+tool_result_event = S2sEvent.text_input_tool(prompt_name, toolContent, result)
+await self.send_raw_event(tool_result_event)
+
+# Send tool content end event
+tool_content_end_event = S2sEvent.content_end(prompt_name, toolContent)
+await self.send_raw_event(tool_content_end_event)
+```
+
+### The Complete Flow in Simple Terms
+
+1. **User says:** "List my EC2 instances"
+2. **Nova Sonic thinks:** "This is an AWS question, I need to use supervisorAgent tool"
+3. **Nova Sonic sends:** toolUse event with the query
+4. **S2S Manager stores:** Tool name, ID, and query content
+5. **Nova Sonic sends:** contentEnd to signal "tool call complete"
+6. **S2S Manager processes:** Calls processToolUse() function
+7. **processToolUse() calls:** supervisor_agent.query("list my EC2 instances")
+8. **Supervisor routes to:** EC2Agent which calls AWS APIs
+9. **Result flows back:** EC2 data → Supervisor → processToolUse → Nova Sonic
+10. **Nova Sonic responds:** With both text and voice containing EC2 instance information
+
+### Why This 3-Step Process?
+
+**Bedrock's Streaming Nature:** Nova Sonic sends data in chunks, so the S2S manager needs to:
+1. **Collect** all the tool information as it arrives
+2. **Wait** for the signal that the tool call is complete  
+3. **Process** the complete tool call and send results back
+
+This ensures the tool call is complete before trying to execute it!
 
 ## Key Data Flow Functions
 
